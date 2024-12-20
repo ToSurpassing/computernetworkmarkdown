@@ -172,7 +172,7 @@ void send(SOCKET& socketClient, SOCKADDR_IN& servAddr, int& servAddrlen, char* m
         u_long mode = 1;
         ioctlsocket(socketClient, FIONBIO, &mode);
 
-        if (recvfrom(socketClient, Buffer, MAXSIZE, 0, (sockaddr*)&servAddr, &servAddrlen) > 0) {//能收到接收端的反馈
+        if (recvfrom(socketClient, Buffer, MAXSIZE, 0, (sockaddr*)&servAddr, &servAddrlen) > 0) {//如果能收到接收端的反馈
             memcpy(&header, Buffer, sizeof(header));
             u_short check = checkSum((u_short*)&header, sizeof(header));
             if (int(check) != 0) {
@@ -180,7 +180,7 @@ void send(SOCKET& socketClient, SOCKADDR_IN& servAddr, int& servAddrlen, char* m
                 cout << "[\033[1;33mInfo\033[0m] 错误的包，等待重传" << endl;
                 continue;
             }
-            else 
+            else //校验和正确
             {
                 // 收到ACK的处理逻辑
                 if (int(header.SEQ) >= head % 256)
@@ -198,53 +198,66 @@ void send(SOCKET& socketClient, SOCKADDR_IN& servAddr, int& servAddrlen, char* m
 
                     cout << "[\033[1;34mReceive\033[0m] 收到了ACK：Flag:" << int(header.flag)
                         << " SEQ:" << int(header.SEQ) << endl;
-
-                    if (state == 0) 
-                    {  // SS状态：慢启动
-                        cwnd++;  // cwnd每收到一个ACK加1
-                        if (cwnd > threshold) {
-                            state = 2;  // 如果cwnd > threshold，进入CA状态
+                    if (int(header.SEQ) != head % 256) {
+                        if (state == 0) 
+                        {
+                            cwnd++;
+                            dup_acks = 0;
+                            if (cwnd > threshold) {
+                                state = 2;  // 如果cwnd > threshold，进入CA状态
+                            }
+                        }
+                        else if (state == 1) 
+                        {
+                            cwnd = threshold;
+                            dup_acks = 0;
+                            state = 2;
+                        }
+                        else if (state == 2) 
+                        {
+                            cwnd += 1.0 / cwnd;  // cwnd按照1/cwnd线性增长，逐步增大
+                            cwnd = floor(cwnd);  // 使用floor函数确保cwnd为整数
+                            if (cwnd <= 0) {
+                                cwnd = 1;
+                            }
                         }
                     }
-                    else if (state == 1) 
-                    {//快速恢复QR状态：进入CA
-                        cwnd = threshold;
-                        dup_acks = 0;
-                        state = 2;
-                    }
-                    else if (state == 2)
-                    {  // CA状态：拥塞避免
-                        cwnd += 1.0 / cwnd;  // cwnd按照1/cwnd线性增长，逐步增大
-                        cwnd = floor(cwnd);  // 使用floor函数确保cwnd为整数
-                        if (cwnd <= 0) {
-                            cwnd = 1;
+                    else if (int(header.SEQ) == head % 256) 
+                    {//收到重复ack
+                        if (dup_acks < 3 ){
+                            if (state == 0){
+                                dup_acks++;
+                                if (cwnd > threshold) {
+                                    state = 2;  // 如果cwnd > threshold，进入CA状态
+                                }
+                            }
+                            else if (state == 1){
+                                cwnd++;
+                            }
+                            else if (state == 2){
+                                dup_acks++;
+                            }
+                        }
+                        else
+                        {
+                            if (state == 0) {
+                                threshold = cwnd / 2;
+                                cwnd = threshold + 3;
+                                state = 1;
+                            }
+                            else if (state == 1) {
+                                cwnd++;
+                            }
+                            else if (state == 2) {
+                                threshold = cwnd / 2;
+                                cwnd = threshold + 3;
+                                state = 1;
+                            }
+                            cout << "[\033[1;33mInfo\033[0m] 从第: " << head << "号数据包开始超时重传" << endl;
+                            send_package(socketClient, servAddr, servAddrlen, message + head * MAXSIZE,
+                                MAXSIZE, head % 256);
                         }
                     }
-
-                    // 处理快速重传的逻辑
-                    if (dup_acks == 3) 
-                    {  // 收到3个重复ACK，认为发生了丢包
-                        cout << "[\033[1;33mInfo\033[0m] 从第: " << head << "号数据包开始超时重传"<<endl;
-                        send_package(socketClient, servAddr, servAddrlen, message + head * MAXSIZE,
-                            MAXSIZE, head % 256);
-                        threshold = cwnd / 2;
-                        cwnd = threshold + 3;  // 设置cwnd为ssthresh + 3
-                        state = 1;  // 进入QR状态
-                    }
-                }
-
-                // 收到旧ACK：非QR状态等待三次重复ACK
-                if (dup_acks >= 3 && state != 1) 
-                {
-                    state = 1;  // 进入QR状态
-                    threshold = cwnd / 2;
-                    cwnd = threshold + 3;  // 设置cwnd为ssthresh + 3
-                }
-
-                // QR状态处理
-                if (state == 1) 
-                {
-                    cwnd++;  // QR状态下每次收到ACK，cwnd增加1
                 }
                 // 如果接收到的ACK序列号小于当前窗口大小（cwnd），但跨越了序列号环，需要更新缓冲区头部
                 else if (head % 256 > 256 - cwnd - 1 && int(header.SEQ) < cwnd) {
@@ -255,21 +268,64 @@ void send(SOCKET& socketClient, SOCKADDR_IN& servAddr, int& servAddrlen, char* m
                         << " SEQ:" << int(header.SEQ) << endl;
 
                     // 进入正常的状态更新处理
-                    if (state == 0) {  // SS状态：慢启动
-                        cwnd++;  // cwnd每收到一个ACK加1
-                        if (cwnd > threshold) {
-                            state = 2;  // 如果cwnd > threshold，进入CA状态
+                    if (int(header.SEQ) != head % 256) {
+                        if (state == 0)
+                        {
+                            cwnd++;
+                            dup_acks = 0;
+                            if (cwnd > threshold) {
+                                state = 2;  // 如果cwnd > threshold，进入CA状态
+                            }
+                        }
+                        else if (state == 1)
+                        {
+                            cwnd = threshold;
+                            dup_acks = 0;
+                            state = 2;
+                        }
+                        else if (state == 2)
+                        {
+                            cwnd += 1.0 / cwnd;  // cwnd按照1/cwnd线性增长，逐步增大
+                            cwnd = floor(cwnd);  // 使用floor函数确保cwnd为整数
+                            if (cwnd <= 0) {
+                                cwnd = 1;
+                            }
                         }
                     }
-                    else if (state == 1) {  // QR状态：进入CA
-                        cwnd = threshold;
-                        state = 2;
-                    }
-                    else if (state == 2) {  // CA状态：拥塞避免
-                        cwnd += 1.0 / cwnd;  // cwnd按照1/cwnd线性增长，逐步增大
-                        cwnd = floor(cwnd);  // 使用floor函数确保cwnd为整数
-                        if (cwnd <= 0) {
-                            cwnd = 1;
+                    else if (int(header.SEQ) == head % 256)
+                    {//收到重复ack
+                        if (dup_acks < 3) {
+                            if (state == 0) {
+                                dup_acks++;
+                                if (cwnd > threshold) {
+                                    state = 2;  // 如果cwnd > threshold，进入CA状态
+                                }
+                            }
+                            else if (state == 1) {
+                                cwnd++;
+                            }
+                            else if (state == 2) {
+                                dup_acks++;
+                            }
+                        }
+                        else
+                        {
+                            if (state == 0) {
+                                threshold = cwnd / 2;
+                                cwnd = threshold + 3;
+                                state = 1;
+                            }
+                            else if (state == 1) {
+                                cwnd++;
+                            }
+                            else if (state == 2) {
+                                threshold = cwnd / 2;
+                                cwnd = threshold + 3;
+                                state = 1;
+                            }
+                            cout << "[\033[1;33mInfo\033[0m] 从第: " << head << "号数据包开始超时重传" << endl;
+                            send_package(socketClient, servAddr, servAddrlen, message + head * MAXSIZE,
+                                MAXSIZE, head % 256);
                         }
                     }
 
